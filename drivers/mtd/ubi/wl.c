@@ -1298,7 +1298,6 @@ retry:
 		up_read(&ubi->fm_protect);
 		return 0;
 	}
-	e->sqnum = UBI_UNKNOWN;
 	if (e == ubi->move_from) {
 		/*
 		 * User is putting the physical eraseblock which was selected to
