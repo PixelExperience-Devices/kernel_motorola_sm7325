@@ -1099,6 +1099,7 @@ int32_t q6core_avcs_load_unload_modules(struct avcs_load_unload_modules_payload
 done:
 	kfree(mod);
 	kfree(rsp_payload);
+	rsp_payload = NULL;
 	mutex_unlock(&(q6core_lcl.cmd_lock));
 	return ret;
 }
