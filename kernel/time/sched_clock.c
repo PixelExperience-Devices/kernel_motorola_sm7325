@@ -21,8 +21,8 @@
 
 #ifdef CONFIG_QTI_RPM_STATS_LOG
 extern ssize_t show_msm_rpmh_master_stats(void);
-#endif
 extern qrtr_first_msg;
+#endif
 
 /**
  * struct clock_read_data - data required to read from sched_clock()
@@ -316,9 +316,8 @@ void sched_clock_resume(void)
 #endif
 #ifdef CONFIG_QTI_RPM_STATS_LOG
 	show_msm_rpmh_master_stats();
-#endif
 	qrtr_first_msg = 1;
-
+#endif
 	rd->read_sched_clock = cd.actual_read_sched_clock;
 }
 
