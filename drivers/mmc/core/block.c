@@ -2086,7 +2086,8 @@ static void mmc_blk_mq_dec_in_flight(struct mmc_queue *mq, enum mmc_issue_type i
 	bool put_card;
 
 	spin_lock_irqsave(&mq->lock, flags);
-mq->in_flight[issue_type] -= 1;
+
+	mq->in_flight[issue_type] -= 1;
 #if defined(CONFIG_SDC_QTI)
 	atomic_dec(&host->active_reqs);
 #endif
