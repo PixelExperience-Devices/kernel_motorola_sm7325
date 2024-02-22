@@ -218,6 +218,47 @@ static int _sde_debugfs_fps_status(struct inode *inode, struct file *file)
 }
 #endif
 
+static ssize_t early_wakeup_store(struct device *device,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct drm_crtc *crtc;
+	struct sde_crtc *sde_crtc;
+	struct msm_drm_private *priv;
+	u32 crtc_id;
+	bool trigger;
+
+	if (!device || !buf || !count) {
+		SDE_ERROR("invalid input param(s)\n");
+		return -EINVAL;
+	}
+
+	if (kstrtobool(buf, &trigger) < 0)
+		return -EINVAL;
+
+	if (!trigger)
+		return count;
+
+	crtc = dev_get_drvdata(device);
+	if (!crtc || !crtc->dev || !crtc->dev->dev_private) {
+		SDE_ERROR("invalid crtc\n");
+		return -EINVAL;
+	}
+
+	sde_crtc = to_sde_crtc(crtc);
+	priv = crtc->dev->dev_private;
+
+	crtc_id = drm_crtc_index(crtc);
+	if (crtc_id >= ARRAY_SIZE(priv->disp_thread)) {
+		SDE_ERROR("invalid crtc index[%d]\n", crtc_id);
+		return -EINVAL;
+	}
+
+	kthread_queue_work(&priv->disp_thread[crtc_id].worker,
+			&sde_crtc->early_wakeup_work);
+
+	return count;
+}
+
 static ssize_t fps_periodicity_ms_store(struct device *device,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -404,12 +445,14 @@ static DEVICE_ATTR_RO(vsync_event);
 static DEVICE_ATTR_RO(measured_fps);
 static DEVICE_ATTR_RW(fps_periodicity_ms);
 static DEVICE_ATTR_RO(retire_frame_event);
+static DEVICE_ATTR_WO(early_wakeup);
 
 static struct attribute *sde_crtc_dev_attrs[] = {
 	&dev_attr_vsync_event.attr,
 	&dev_attr_measured_fps.attr,
 	&dev_attr_fps_periodicity_ms.attr,
 	&dev_attr_retire_frame_event.attr,
+	&dev_attr_early_wakeup.attr,
 	NULL
 };
 
@@ -2216,8 +2259,6 @@ static void sde_crtc_frame_event_cb(void *data, u32 event)
 	struct msm_drm_private *priv;
 	struct sde_crtc_frame_event *fevent;
 	struct sde_kms_frame_event_cb_data *cb_data;
-	struct drm_plane *plane;
-	u32 ubwc_error;
 	unsigned long flags;
 	u32 crtc_id;
 
@@ -2247,34 +2288,9 @@ static void sde_crtc_frame_event_cb(void *data, u32 event)
 	spin_unlock_irqrestore(&sde_crtc->fevent_spin_lock, flags);
 
 	if (!fevent) {
-		SDE_ERROR("crtc%d event %d overflow\n",
-				crtc->base.id, event);
+		SDE_ERROR("crtc%d event %d overflow\n", DRMID(crtc), event);
 		SDE_EVT32(DRMID(crtc), event);
 		return;
-	}
-
-	/* log and clear plane ubwc errors if any */
-	if (event & (SDE_ENCODER_FRAME_EVENT_ERROR
-				| SDE_ENCODER_FRAME_EVENT_PANEL_DEAD
-				| SDE_ENCODER_FRAME_EVENT_DONE)) {
-		drm_for_each_plane_mask(plane, crtc->dev,
-						sde_crtc->plane_mask_old) {
-			ubwc_error = sde_plane_get_ubwc_error(plane);
-			if (ubwc_error) {
-				SDE_EVT32(DRMID(crtc), DRMID(plane),
-						ubwc_error, SDE_EVTLOG_ERROR);
-				SDE_DEBUG("crtc%d plane %d ubwc_error %d\n",
-						DRMID(crtc), DRMID(plane),
-						ubwc_error);
-				sde_plane_clear_ubwc_error(plane);
-			}
-		}
-	}
-
-	if ((event & SDE_ENCODER_FRAME_EVENT_SIGNAL_RETIRE_FENCE) &&
-		(sde_crtc && sde_crtc->retire_frame_event_sf)) {
-		sde_crtc->retire_frame_event_time = ktime_get();
-		sysfs_notify_dirent(sde_crtc->retire_frame_event_sf);
 	}
 
 	fevent->event = event;
@@ -2470,6 +2486,9 @@ static void sde_crtc_frame_event_work(struct kthread_work *work)
 	struct sde_kms *sde_kms;
 	unsigned long flags;
 	bool in_clone_mode = false;
+	int ret;
+	struct drm_plane *plane;
+	u32 ubwc_error;
 
 	if (!work) {
 		SDE_ERROR("invalid work handle\n");
@@ -2504,6 +2523,28 @@ static void sde_crtc_frame_event_work(struct kthread_work *work)
 	if (!in_clone_mode && (fevent->event & (SDE_ENCODER_FRAME_EVENT_ERROR
 					| SDE_ENCODER_FRAME_EVENT_PANEL_DEAD
 					| SDE_ENCODER_FRAME_EVENT_DONE))) {
+
+		ret = pm_runtime_resume_and_get(crtc->dev->dev);
+		if (ret < 0) {
+			SDE_ERROR("failed to enable power resource %d\n", ret);
+			SDE_EVT32(ret, SDE_EVTLOG_ERROR);
+		} else {
+			/* log and clear plane ubwc errors if any */
+			drm_for_each_plane_mask(plane, crtc->dev,
+						sde_crtc->plane_mask_old) {
+				ubwc_error = sde_plane_get_ubwc_error(plane);
+				if (ubwc_error) {
+					SDE_EVT32(DRMID(crtc), DRMID(plane),
+					ubwc_error, SDE_EVTLOG_ERROR);
+					SDE_DEBUG("crtc%d plane %d ubwc_error %d\n",
+					DRMID(crtc), DRMID(plane),
+					ubwc_error);
+					sde_plane_clear_ubwc_error(plane);
+				}
+			}
+			pm_runtime_put_sync(crtc->dev->dev);
+		}
+
 		if (atomic_read(&sde_crtc->frame_pending) < 1) {
 			/* this should not happen */
 			SDE_ERROR("crtc%d ts:%lld invalid frame_pending:%d\n",
@@ -2534,11 +2575,17 @@ static void sde_crtc_frame_event_work(struct kthread_work *work)
 		SDE_ATRACE_END("signal_release_fence");
 	}
 
-	if (fevent->event & SDE_ENCODER_FRAME_EVENT_SIGNAL_RETIRE_FENCE)
+	if (fevent->event & SDE_ENCODER_FRAME_EVENT_SIGNAL_RETIRE_FENCE) {
+		if (sde_crtc->retire_frame_event_sf) {
+			sde_crtc->retire_frame_event_time = fevent->ts;
+			sysfs_notify_dirent(sde_crtc->retire_frame_event_sf);
+		}
+
 		/* this api should be called without spin_lock */
 		_sde_crtc_retire_event(fevent->connector, fevent->ts,
 				(fevent->event & SDE_ENCODER_FRAME_EVENT_ERROR)
 				? SDE_FENCE_SIGNAL_ERROR : SDE_FENCE_SIGNAL);
+	}
 
 	if (fevent->event & SDE_ENCODER_FRAME_EVENT_PANEL_DEAD)
 		SDE_ERROR("crtc%d ts:%lld received panel dead event\n",
@@ -3808,8 +3855,6 @@ void sde_crtc_commit_kickoff(struct drm_crtc *crtc,
 		SDE_EVT32(DRMID(crtc), SDE_EVTLOG_FUNC_CASE2);
 	}
 	sde_crtc->play_count++;
-
-	sde_vbif_clear_errors(sde_kms);
 
 	if (is_error) {
 		_sde_crtc_remove_pipe_flush(crtc);
@@ -6665,22 +6710,38 @@ static void __sde_crtc_idle_notify_work(struct kthread_work *work)
 	}
 }
 
-void sde_crtc_cancel_delayed_work(struct drm_crtc *crtc)
+/*
+ * __sde_crtc_early_wakeup_work - trigger early wakeup from user space
+ */
+static void __sde_crtc_early_wakeup_work(struct kthread_work *work)
 {
-	struct sde_crtc *sde_crtc;
-	struct sde_crtc_state *cstate;
-	bool idle_status;
-	bool cache_status;
+	struct sde_crtc *sde_crtc = container_of(work, struct sde_crtc,
+				early_wakeup_work);
+	struct drm_crtc *crtc;
+	struct drm_device *dev;
+	struct msm_drm_private *priv;
+	struct sde_kms *sde_kms;
 
-	if (!crtc || !crtc->state)
+	if (!sde_crtc) {
+		SDE_ERROR("invalid sde crtc\n");
 		return;
+	}
 
-	sde_crtc = to_sde_crtc(crtc);
-	cstate = to_sde_crtc_state(crtc->state);
+	if (!sde_crtc->enabled) {
+		SDE_INFO("sde crtc is not enabled\n");
+		return;
+	}
 
-	idle_status = kthread_cancel_delayed_work_sync(&sde_crtc->idle_notify_work);
-	cache_status = kthread_cancel_delayed_work_sync(&sde_crtc->static_cache_read_work);
-	SDE_EVT32(DRMID(crtc), idle_status, cache_status);
+	crtc = &sde_crtc->base;
+	dev = crtc->dev;
+	if (!dev) {
+		SDE_ERROR("invalid drm device\n");
+		return;
+	}
+
+	priv = dev->dev_private;
+	sde_kms = to_sde_kms(priv->kms);
+	sde_kms_trigger_early_wakeup(sde_kms, crtc);
 }
 
 /* initialize crtc */
@@ -6779,6 +6840,8 @@ struct drm_crtc *sde_crtc_init(struct drm_device *dev, struct drm_plane *plane)
 					__sde_crtc_idle_notify_work);
 	kthread_init_delayed_work(&sde_crtc->static_cache_read_work,
 			__sde_crtc_static_cache_read_work);
+	kthread_init_work(&sde_crtc->early_wakeup_work,
+					__sde_crtc_early_wakeup_work);
 
 	SDE_DEBUG("crtc=%d new_llcc=%d, old_llcc=%d\n",
 		crtc->base.id,

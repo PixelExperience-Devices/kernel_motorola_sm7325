@@ -867,6 +867,15 @@ struct msm_drm_thread {
 	struct kthread_worker worker;
 };
 
+struct msm_idle {
+	u32 timeout_ms;
+	u32 encoder_mask;
+	u32 active_mask;
+
+	spinlock_t lock;
+	struct delayed_work work;
+};
+
 struct msm_drm_private {
 
 	struct drm_device *dev;
@@ -927,6 +936,8 @@ struct msm_drm_private {
 	struct task_struct *pp_event_thread;
 	struct kthread_worker pp_event_worker;
 
+	struct kthread_work thread_priority_work;
+
 	unsigned int num_encoders;
 	struct drm_encoder *encoders[MAX_ENCODERS];
 
@@ -981,6 +992,8 @@ struct msm_drm_private {
 	struct mutex vm_client_lock;
 	struct list_head vm_client_list;
 	struct notifier_block msm_drv_notifier;
+
+	struct msm_idle idle;
 };
 
 /* get struct msm_kms * from drm_device * */
@@ -1014,8 +1027,6 @@ void __msm_fence_worker(struct work_struct *work);
 struct drm_atomic_state *msm_atomic_state_alloc(struct drm_device *dev);
 void msm_atomic_state_clear(struct drm_atomic_state *state);
 void msm_atomic_state_free(struct drm_atomic_state *state);
-
-void msm_atomic_flush_display_threads(struct msm_drm_private *priv);
 
 int msm_gem_init_vma(struct msm_gem_address_space *aspace,
 		struct msm_gem_vma *vma, int npages);
@@ -1258,6 +1269,7 @@ static inline void __exit msm_mdp_unregister(void)
 }
 #endif /* CONFIG_DRM_MSM_MDP5 */
 
+void msm_idle_set_state(struct drm_encoder *encoder, bool active);
 #ifdef CONFIG_DEBUG_FS
 void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m);
 void msm_gem_describe_objects(struct list_head *list, struct seq_file *m);
